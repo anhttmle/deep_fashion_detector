@@ -9,15 +9,19 @@ class DFImageGeneratorByPath(keras.utils.Sequence):
     def __init__(
             self,
             dataset: list,
-            batch_size: int = 16,
+            batch_size: int = 8,
             target_size=(256, 256),
             n_channel=3,
+            classes: list = [],
+            need_augment=False
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.target_size = target_size
         self.n_channel = n_channel
         self.augmenter = DERandAugment()
+        self.classes = classes
+        self.need_augment = need_augment
         return
 
     def __len__(self):
@@ -41,15 +45,20 @@ class DFImageGeneratorByPath(keras.utils.Sequence):
                 }
             ]
 
+            # image = image.crop(annotations[0][ObjDetection.BBOX])
             image, annotations = normalize.resize(image=image, annotations=annotations, target_size=self.target_size)
-            image, annotations = self.augmenter.transform(image=image, annotations=annotations)
+            if self.need_augment:
+                image, annotations = self.augmenter.transform(image=image, annotations=annotations)
+
             image, annotations = normalize.scale_to_unit(image=image, annotations=annotations)
 
+
             batch_images[i] = image
-            batch_label[i] = annotations[0][ObjDetection.LABEL]
+            batch_label[i] = self.classes.index(annotations[0][ObjDetection.LABEL])
             batch_bbox[i] = annotations[0][ObjDetection.BBOX]
 
-        return batch_images, [batch_label, batch_bbox]
+        return batch_images, batch_label
+        # return batch_images, [batch_label, batch_bbox]
 
     def on_epoch_end(self):
         return
@@ -58,108 +67,159 @@ class DFImageGeneratorByPath(keras.utils.Sequence):
 import utils.visualize as visualize
 import data.loader as loader
 from augmentation.transform import DERandAugment
-from tensorflow.keras.applications.resnet50 import ResNet50
+from tensorflow.keras.applications.densenet import DenseNet121
 
 
+train_set, dev_set, test_set = loader.get_deep_fashion_annotations_by_category_type()
+# train_set, dev_set, test_set = loader.get_deep_fashion_annotations()
 
-train_set, dev_set, test_set = loader.get_deep_fashion_annotations()
+classes = [item["category"] for item in train_set] + [item["category"] for item in dev_set] + [item["category"] for item in test_set]
+classes = np.array(list(set(classes)))
+np.save("classes.npy", classes)
+classes = classes.tolist()
 
 train_gen = DFImageGeneratorByPath(
-    train_set
+    train_set,
+    classes=classes,
+    need_augment=True
 )
 
 dev_gen = DFImageGeneratorByPath(
-    dev_set
+    dev_set,
+    classes=classes
 )
 
 test_gen = DFImageGeneratorByPath(
-    test_set
+    test_set,
+    classes=classes
 )
 
 
 def build_model():
-    model_resnet = ResNet50(weights='imagenet', include_top=False, pooling='avg')
-    for layer in model_resnet.layers[:-12]:
+    model_resnet = DenseNet121(include_top=False, pooling='avg')
+    # model_resnet = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+    # for layer in model_resnet.layers[:-12]:
         # 6 - 12 - 18 have been tried. 12 is the best.
-        layer.trainable = False
+        # print(layer)
+        # layer.trainable = False
 
     x = model_resnet.output # (None, 2048)
     # print(len(model_resnet.layers))
     # return
-    x = keras.layers.Dense(512, activation='elu', kernel_regularizer=keras.regularizers.l2(0.001))(x)
-    y = keras.layers.Dense(60, activation='softmax', name='img')(x)
+    # x = keras.layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(x)
+    y = keras.layers.Dense(3, activation='softmax', name='img')(x)
 
-    x_bbox = model_resnet.output
-    x_bbox = keras.layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(x_bbox)
-    x_bbox = keras.layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(x_bbox)
-    bbox = keras.layers.Dense(4, kernel_initializer='normal', name='bbox')(x_bbox)
+    # x_bbox = model_resnet.output
+    # x_bbox = keras.layers.Dense(512, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(x_bbox)
+    # x_bbox = keras.layers.Dense(128, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001))(x_bbox)
+    # bbox = keras.layers.Dense(4, kernel_initializer='normal', name='bbox')(x_bbox)
 
     final_model = keras.models.Model(
         inputs=model_resnet.input,
-        outputs=[y, bbox]
+        outputs=y
+        #outputs=[y, bbox]
     )
 
-    opt = keras.optimizers.Adam(lr=0.0001)
+    opt = keras.optimizers.Adam()
+    # opt = keras.optimizers.Adam(lr=0.0001, )
     final_model.compile(optimizer=opt,
                         loss={
                             'img': 'sparse_categorical_crossentropy',
-                            'bbox': 'mean_squared_error'
+                    #        'bbox': 'mean_squared_error'
                         },
                         metrics={
-                            'img': ['accuracy', 'top_k_categorical_accuracy'],  # default: top-5
-                            'bbox': ['mse']
+                            'img': [
+                                'accuracy',
+                                # 'sparse_top_k_categorical_accuracy'
+                            ],  # default: top-5
+                     #       'bbox': ['mse']
                         }
                         )
     return final_model
 
 
-build_model()
+def experiment():
 
-lr_reducer = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss',
-    patience=12,
-    factor=0.5,
-    verbose=1
-)
+    lr_reducer = keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        patience=12,
+        factor=0.5,
+        verbose=1
+    )
 
-# # tensorboard = keras.callbacks.TensorBoard(log_dir='./logs')
-early_stopper = keras.callbacks.EarlyStopping(monitor='val_loss',
-                              patience=30,
-                              verbose=1)
-# # checkpoint = keras.callbacks.ModelCheckpoint('./models/model.h5')
-#
-final_model = build_model()
-final_model.fit_generator(
-    train_gen,
-    epochs=24,
-    validation_data=dev_gen,
-    verbose=1,
-    shuffle=True,
-    callbacks=[lr_reducer, early_stopper],
-    workers=1
-)
+    # # tensorboard = keras.callbacks.TensorBoard(log_dir='./logs')
+    early_stopper = keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                  patience=30,
+                                                  verbose=1)
+    checkpoint = keras.callbacks.ModelCheckpoint(filepath='model.h5')
+    final_model = build_model()
+    # final_model.evaluate(dev_gen)
+    # return
+    #final_model.load_weights("model.h5")
+    final_model.fit_generator(
+        train_gen,
+        epochs=200,
+        validation_data=dev_gen,
+        verbose=1,
+        shuffle=True,
+        callbacks=[lr_reducer, early_stopper, checkpoint],
+        workers=1
+    )
 
-final_model.save("demo_detector.h5")
+    final_model.save("demo_detector.h5")
 
-print("FINISH TRAINING")
+    print("FINISH TRAINING")
 
-scores = final_model.evaluate_generator(
-    test_gen,
-    verbose=1
-)
+    scores = final_model.evaluate_generator(
+        test_gen,
+        verbose=1
+    )
+
+    return
+
+
+def test_model():
+    model = keras.models.load_model("model.h5")
+    model.evaluate_generator(dev_gen, verbose=1)
+
+    for example in train_gen:
+        result = model.predict(example[0][0:1])
+        print(result)
+        visualize.show_image(
+            image=example[0][0],
+            annotations=[
+                {
+                    ObjDetection.BBOX: result[1][0]*256
+                }
+            ]
+        )
+        break
+    return
+
+
+experiment()
+test_model()
 
 # augmenter = DERandAugment()
+print(len(train_set), len(dev_set), len(test_set))
 
-# for images, labels, bboxs in generator:
-#     print(bboxs.shape)
-#     for i in range(len(images)):
-#         image = images[i]
-#         annotations = [
-#                 {
-#                     ObjDetection.BBOX: bboxs[i],
-#                     ObjDetection.LABEL: labels[i],
-#                 }
-#             ]
+for images, labels in DFImageGeneratorByPath(
+# for images, (labels, bboxs) in DFImageGeneratorByPath(
+    dataset=dev_set,
+    classes=classes
+):
+    for i in range(len(images)):
+        image = images[i]
+        annotations = [
+                {
+                    ObjDetection.BBOX: [0,0,0,0],
+                    ObjDetection.LABEL: labels[i],
+                }
+            ]
+
+        visualize.show_image(image, annotations)
+        # image = image.crop(annotations[0][ObjDetection.BBOX])
+        # visualize.show_image(image, annotations)
 
 
 
